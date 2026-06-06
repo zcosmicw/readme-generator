@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>README Generator</title>
+</head>
+<body>
+  <h1>README Generator</h1>
+
+  <label>Model<br>
+    <select id="modelSelect">
+      <option value="google/gemma-4-31b-it:free">Gemma 4 31B (free) — best quality</option>
+      <option value="nvidia/nemotron-3-super-120b-a12b:free">NVIDIA Nemotron 120B (free)</option>
+      <option value="openai/gpt-oss-120b:free">GPT OSS 120B (free)</option>
+      <option value="deepseek/deepseek-chat:free">DeepSeek V3 (free)</option>
+      <option value="google/gemini-2.0-flash-exp:free">Gemini 2.0 Flash (free)</option>
+    </select>
+  </label>
+  <br><br>
+
+  <label>GitHub Repo URL<br>
+    <input type="text" id="repoUrl" placeholder="https://github.com/username/repo" style="width:400px;" />
+  </label>
+  <br><br>
+
+  <label>Sections to include<br>
+    <label><input type="checkbox" class="section" value="overview" checked> Overview</label>
+    <label><input type="checkbox" class="section" value="features" checked> Features</label>
+    <label><input type="checkbox" class="section" value="tech_stack" checked> Tech Stack</label>
+    <label><input type="checkbox" class="section" value="installation" checked> Installation</label>
+    <label><input type="checkbox" class="section" value="usage" checked> Usage</label>
+    <label><input type="checkbox" class="section" value="contributing"> Contributing</label>
+    <label><input type="checkbox" class="section" value="license"> License</label>
+  </label>
+  <br><br>
+
+  <label>Tone<br>
+    <select id="tone">
+      <option value="professional">Professional</option>
+      <option value="casual">Casual</option>
+      <option value="minimal">Minimal</option>
+      <option value="detailed">Detailed</option>
+    </select>
+  </label>
+  <br><br>
+
+  <button id="analyzeBtn" onclick="analyze()">Step 1 — Analyze Repo</button>
+  <span id="analyzeStatus"></span>
+  <br><br>
+
+  <div id="repoInfo" style="display:none; background:#f4f4f4; padding:10px; margin-bottom:10px; white-space:pre-wrap; font-family:monospace; font-size:13px; max-height:200px; overflow:auto;"></div>
+
+  <button id="generateBtn" onclick="generate()" disabled>Step 2 — Generate README</button>
+  <span id="generateStatus"></span>
+  <br><br>
+
+  <div id="outputArea" style="display:none;">
+    <label>Generated README.md<br>
+      <textarea id="readmeOutput" rows="30" style="width:100%; font-family:monospace; font-size:13px;"></textarea>
+    </label>
+    <br>
+    <button onclick="copyReadme()">Copy</button>
+    <button onclick="downloadReadme()">Download README.md</button>
+    <button onclick="generate()">Regenerate</button>
+  </div>
+
+  <script>
+    let repoData = null;
+
+    function parseRepoUrl(url) {
+      url = url.trim().replace(/\/$/, '');
+      const m = url.match(/github\.com\/([^\/]+)\/([^\/\?#]+)/);
+      if (!m) return null;
+      return { owner: m[1], repo: m[2].replace(/\.git$/, '') };
+    }
+
+    function decodeContent(content) {
+      return atob(content.replace(/\n/g, ''));
+    }
+
+    async function fetchFileContent(owner, repo, path, maxChars = 2000) {
+      try {
+        const r = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`);
+        if (!r.ok) return null;
+        const d = await r.json();
+        if (d.content && d.size < 200000) return decodeContent(d.content).slice(0, maxChars);
+      } catch (e) {}
+      return null;
+    }
+
+    async function fetchDir(owner, repo, path) {
+      try {
+        const r = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`);
+        if (!r.ok) return [];
+        const d = await r.json();
+        return Array.isArray(d) ? d : [];
+      } catch (e) { return []; }
+    }
+
+    async function collectFiles(owner, repo, path, maxDepth, maxFiles, collected = []) {
+      if (maxDepth <= 0 || collected.length >= maxFiles) return collected;
+      const entries = await fetchDir(owner, repo, path);
+      for (const entry of entries) {
+        if (collected.length >= maxFiles) break;
+        if (entry.type === 'file') {
+          collected.push({ path: entry.path, name: entry.name, size: entry.size });
+        } else if (entry.type === 'dir') {
+          const skip = ['node_modules','.git','dist','build','__pycache__','.next',
+                        'venv','env','.venv','vendor','coverage','.cache','out',
+                        'target','bin','obj','.idea','.vscode'];
+          if (!skip.includes(entry.name)) {
+            await collectFiles(owner, repo, entry.path, maxDepth - 1, maxFiles, collected);
+          }
+        }
+      }
+      return collected;
+    }
+
+    async function analyze() {
+      const url = document.getElementById('repoUrl').value.trim();
+      const parsed = parseRepoUrl(url);
+      if (!parsed) { document.getElementById('analyzeStatus').textContent = ' Invalid GitHub URL'; return; }
+
+      const setStatus = t => document.getElementById('analyzeStatus').textContent = ' ' + t;
+      setStatus('Fetching repo info...');
+      document.getElementById('analyzeBtn').disabled = true;
+      document.getElementById('generateBtn').disabled = true;
+      document.getElementById('repoInfo').style.display = 'none';
+
+      try {
+        const { owner, repo } = parsed;
+
+        setStatus('Fetching metadata...');
+        const [repoRes, langsRes, commitsRes] = await Promise.all([
+          fetch(`https://api.github.com/repos/${owner}/${repo}`),
+          fetch(`https://api.github.com/repos/${owner}/${repo}/languages`),
+          fetch(`https://api.github.com/repos/${owner}/${repo}/commits?per_page=10`)
+        ]);
+
+        if (!repoRes.ok) throw new Error(repoRes.status === 404 ? 'Repo not found — is it private?' : 'GitHub API error ' + repoRes.status);
+
+        const repoMeta = await repoRes.json();
+        const langs = langsRes.ok ? await langsRes.json() : {};
+        const commits = commitsRes.ok ? await commitsRes.json() : [];
+
+        setStatus('Scanning file tree...');
+        const allFiles = await collectFiles(owner, repo, '', 3, 80);
+        const allFilePaths = allFiles.map(f => f.path);
+
+        const configNames = [
+          'package.json','package-lock.json','yarn.lock','pnpm-lock.yaml',
+          'requirements.txt','requirements-dev.txt','Pipfile',
+          'pyproject.toml','setup.py','setup.cfg',
+          'Cargo.toml','Cargo.lock','go.mod','go.sum',
+          'pom.xml','build.gradle','build.gradle.kts',
+          'composer.json','Gemfile','CMakeLists.txt','Makefile','makefile',
+          'Dockerfile','docker-compose.yml','docker-compose.yaml',
+          '.env.example','.env.sample',
+          'tsconfig.json','vite.config.js','vite.config.ts',
+          'next.config.js','next.config.ts','nuxt.config.js','svelte.config.js',
+          'tailwind.config.js','tailwind.config.ts',
+          'vercel.json','netlify.toml','fly.toml',
+        ];
+        const sourceExts = ['.js','.jsx','.ts','.tsx','.mjs','.cjs',
+                            '.py','.go','.rs','.java','.kt','.rb','.php',
+                            '.cpp','.c','.h','.cs','.swift','.dart','.vue','.svelte'];
+
+        const configFiles = allFiles.filter(f => configNames.some(c => f.path.endsWith(c) || f.name === c));
+        const sourceFiles = allFiles.filter(f => sourceExts.some(ext => f.name.endsWith(ext)));
+
+        const entryPointPatterns = [
+          /^(src\/|app\/|lib\/)?(index|main|app|server|cli|mod)\.(js|jsx|ts|tsx|py|go|rs|java|rb|php|cs|swift)$/i,
+          /^(src\/|app\/)?(App|Main|Program)\.(js|jsx|ts|tsx|py|java|cs|swift)$/i,
+          /^main\.(go|rs|c|cpp)$/i,
+          /^__main__\.py$/i
+        ];
+        const entryPoints = sourceFiles.filter(f => entryPointPatterns.some(p => p.test(f.path)));
+        const routeFiles = sourceFiles.filter(f => /route|controller|handler|endpoint|api/i.test(f.name)).slice(0, 4);
+        const modelFiles = sourceFiles.filter(f => /model|schema|entity|type|interface/i.test(f.name)).slice(0, 3);
+        const testFiles  = sourceFiles.filter(f => /\.(test|spec)\.|__tests__|\/tests?\//.test(f.path)).slice(0, 3);
+
+        const toRead = [
+          ...entryPoints.slice(0, 3),
+          ...configFiles.slice(0, 6),
+          ...routeFiles,
+          ...modelFiles,
+          ...testFiles,
+          ...sourceFiles.filter(f =>
+            !entryPoints.includes(f) && !routeFiles.includes(f) &&
+            !modelFiles.includes(f) && !testFiles.includes(f)
+          ).slice(0, 4)
+        ].filter((f, i, arr) => arr.findIndex(x => x.path === f.path) === i).slice(0, 20);
+
+        setStatus(`Reading ${toRead.length} files...`);
+        const fileContents = {};
+        await Promise.all(toRead.map(async f => {
+          const isConfig = configFiles.some(c => c.path === f.path);
+          const text = await fetchFileContent(owner, repo, f.path, isConfig ? 2500 : 1500);
+          if (text) fileContents[f.path] = text;
+        }));
+
+        let existingReadme = '';
+        const readmeFile = allFiles.find(f => /^readme(\.(md|txt|rst|mdx))?$/i.test(f.name));
+        if (readmeFile) {
+          const text = await fetchFileContent(owner, repo, readmeFile.path, 1500);
+          if (text) existingReadme = text;
+        }
+
+        const commitMessages = Array.isArray(commits)
+          ? commits.slice(0, 10).map(c => c.commit?.message?.split('\n')[0]).filter(Boolean)
+          : [];
+
+        let contributorCount = 0;
+        try {
+          const cr = await fetch(`https://api.github.com/repos/${owner}/${repo}/contributors?per_page=1&anon=true`);
+          if (cr.ok) {
+            const link = cr.headers.get('link') || '';
+            const m = link.match(/page=(\d+)>; rel="last"/);
+            contributorCount = m ? parseInt(m[1]) : (await cr.json()).length;
+          }
+        } catch (e) {}
+
+        repoData = {
+          repoMeta, langs, allFilePaths, fileContents, existingReadme,
+          commitMessages, contributorCount, parsed,
+          entryPointPaths: entryPoints.map(f => f.path),
+          routePaths: routeFiles.map(f => f.path),
+          modelPaths: modelFiles.map(f => f.path),
+          testPaths: testFiles.map(f => f.path),
+          configPaths: configFiles.map(f => f.path),
+        };
+
+        const info = [
+          `Repo: ${repoMeta.full_name}`,
+          `Description: ${repoMeta.description || 'none'}`,
+          `Language: ${repoMeta.language} | All: ${Object.keys(langs).join(', ')}`,
+          `Stars: ${repoMeta.stargazers_count} | Forks: ${repoMeta.forks_count} | Contributors: ~${contributorCount}`,
+          `Created: ${repoMeta.created_at?.slice(0,10)} | Updated: ${repoMeta.updated_at?.slice(0,10)}`,
+          `License: ${repoMeta.license?.name || 'none'} | Topics: ${(repoMeta.topics||[]).join(', ')||'none'}`,
+          `Total files scanned: ${allFiles.length}`,
+          `Files read: ${Object.keys(fileContents).length} (${Object.keys(fileContents).join(', ')})`,
+          `Entry points: ${repoData.entryPointPaths.join(', ') || 'none detected'}`,
+          `Route/API files: ${repoData.routePaths.join(', ') || 'none'}`,
+          `Recent commits: ${commitMessages.slice(0,5).join(' | ')}`,
+          `Existing README: ${existingReadme ? 'yes' : 'none'}`,
+        ].join('\n');
+
+        document.getElementById('repoInfo').style.display = 'block';
+        document.getElementById('repoInfo').textContent = info;
+        document.getElementById('generateBtn').disabled = false;
+        setStatus('Done — ready to generate');
+      } catch (e) {
+        setStatus('Error: ' + e.message);
+      }
+      document.getElementById('analyzeBtn').disabled = false;
+    }
+
+    async function generate() {
+      if (!repoData) { alert('Analyze a repo first.'); return; }
+
+      const model = document.getElementById('modelSelect').value;
+      const tone = document.getElementById('tone').value;
+      const sections = [...document.querySelectorAll('.section:checked')].map(c => c.value);
+      if (!sections.length) { alert('Pick at least one section.'); return; }
+
+      document.getElementById('generateStatus').textContent = ' Generating...';
+      document.getElementById('generateBtn').disabled = true;
+      document.getElementById('outputArea').style.display = 'none';
+
+      const {
+        repoMeta, langs, allFilePaths, fileContents, existingReadme,
+        commitMessages, contributorCount, parsed,
+        entryPointPaths, routePaths, modelPaths, testPaths, configPaths
+      } = repoData;
+
+      const dumpSection = (label, paths) => {
+        const relevant = paths.filter(p => fileContents[p]);
+        if (!relevant.length) return '';
+        return `### ${label}\n` + relevant.map(p => `--- ${p} ---\n${fileContents[p]}`).join('\n\n');
+      };
+
+      const fileDump = [
+        dumpSection('Entry Points / Main Files', entryPointPaths),
+        dumpSection('Config & Dependencies', configPaths),
+        dumpSection('Routes / API Handlers', routePaths),
+        dumpSection('Models / Schemas', modelPaths),
+        dumpSection('Tests', testPaths),
+        dumpSection('Other Source Files', Object.keys(fileContents).filter(p =>
+          !entryPointPaths.includes(p) && !configPaths.includes(p) &&
+          !routePaths.includes(p) && !modelPaths.includes(p) && !testPaths.includes(p)
+        )),
+      ].filter(Boolean).join('\n\n');
+
+      const prompt = `You are an expert technical writer. Generate a README.md that is specific, accurate, and genuinely useful — not generic boilerplate. Every claim must be grounded in the actual code and config provided below.
+
+## Repository Metadata
+- Name: ${parsed.owner}/${parsed.repo}
+- Description: ${repoMeta.description || 'not provided — infer from code'}
+- Primary language: ${repoMeta.language || 'unknown'}
+- All languages detected: ${Object.keys(langs).join(', ') || 'unknown'}
+- Stars: ${repoMeta.stargazers_count} | Forks: ${repoMeta.forks_count} | Contributors: ~${contributorCount}
+- Created: ${repoMeta.created_at?.slice(0,10)} | Last updated: ${repoMeta.updated_at?.slice(0,10)}
+- License: ${repoMeta.license?.name || 'not specified'}
+- Topics/tags: ${(repoMeta.topics||[]).join(', ') || 'none'}
+- Homepage: ${repoMeta.homepage || 'none'}
+
+## Full File Tree (${allFilePaths.length} files)
+${allFilePaths.join('\n')}
+
+## File Contents
+${fileDump || 'No file contents could be read.'}
+
+## Recent Commit History
+${commitMessages.length ? commitMessages.map((m,i) => `${i+1}. ${m}`).join('\n') : 'not available'}
+
+${existingReadme ? `## Existing README (context only — rewrite it better)\n${existingReadme}` : ''}
+
+## Instructions
+- Output raw markdown only. No explanations, no wrapping code fences.
+- Sections to include in order: ${sections.join(', ')}
+- Tone: ${tone}
+- Be specific to THIS repo — real file names, real dependency names, real commands from scripts/Makefile. No placeholders.
+- Overview: what the project does, the problem it solves, who it's for. Infer from code if description is vague.
+- Features: only real capabilities visible in the code.
+- Tech stack: exact libraries/frameworks from dependency files, with versions if visible.
+- Installation: real commands, real env vars from .env.example if present.
+- Usage: real examples — actual CLI flags, API endpoints, function signatures you can see.
+- ${tone === 'minimal' ? 'Be concise. Short sections.' : tone === 'detailed' ? 'Be thorough with examples and explanations.' : 'Balance depth with readability.'}
+- Proper markdown: fenced code blocks with language tags, tables where helpful.
+- Do not hallucinate. If unsure, omit.`;
+
+      try {
+        const res = await fetch('/api/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model, prompt }),
+        });
+
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Server error');
+
+        document.getElementById('readmeOutput').value = data.readme;
+        document.getElementById('outputArea').style.display = 'block';
+        document.getElementById('generateStatus').textContent = ' Done';
+      } catch (e) {
+        document.getElementById('generateStatus').textContent = ' Error: ' + e.message;
+      }
+
+      document.getElementById('generateBtn').disabled = false;
+    }
+
+    function copyReadme() {
+      navigator.clipboard.writeText(document.getElementById('readmeOutput').value)
+        .then(() => alert('Copied!'));
+    }
+
+    function downloadReadme() {
+      const val = document.getElementById('readmeOutput').value;
+      const a = document.createElement('a');
+      a.href = 'data:text/markdown;charset=utf-8,' + encodeURIComponent(val);
+      a.download = 'README.md';
+      a.click();
+    }
+  </script>
+</body>
+</html>
